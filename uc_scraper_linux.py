@@ -7,10 +7,11 @@ Supports x86_64 and ARM64 Linux servers (including snap-installed Chromium).
 Usage (import into any project):
     from image_scraper import create_driver, scrape_thumbnails, download_thumbnails, shutdown_driver
 
-    driver = create_driver()                             # Call ONCE at server startup
+    driver = create_driver()
     links  = scrape_thumbnails(driver, "sunflower")
-    saved  = download_thumbnails(links, "sunflower")     # → static/plants/sunflower_1.jpg …
-    shutdown_driver(driver)                              # Call ONCE at server shutdown
+    saved  = download_thumbnails(links, "sunflower", base_url="http://192.168.1.10:5000")
+    # → ["http://192.168.1.10:5000/static/plants/sunflower_1.webp", ...]
+    shutdown_driver(driver)
 """
 
 import os
@@ -22,15 +23,16 @@ import subprocess
 import time
 import logging
 import threading
+from io import BytesIO
 from typing import Optional
 
 import requests
+from PIL import Image
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.service import Service
 
-# Optional: Xvfb is only needed on headless Linux servers.
 try:
     from xvfbwrapper import Xvfb
     XVFB_AVAILABLE = True
@@ -38,7 +40,7 @@ except ImportError:
     XVFB_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Module-level logger
+# Logger
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -53,9 +55,6 @@ _vdisplay: Optional[object] = None
 _driver_lock = threading.Lock()
 
 PLANTS_DIR = "static/plants"
-
-# How many extra candidates to fetch beyond `count` so we can survive
-# data-URIs and filter to real HTTP images when possible.
 _CANDIDATE_MULTIPLIER = 5
 
 
@@ -109,6 +108,7 @@ def _find_chromedriver(chrome_version: int) -> Optional[str]:
     return None
 
 
+
 def _query_to_prefix(query: str) -> str:
     prefix = query.lower().strip()
     prefix = re.sub(r"[^\w\s]", "", prefix)
@@ -116,45 +116,36 @@ def _query_to_prefix(query: str) -> str:
     return prefix
 
 
-def _ext_from_url(url: str, default: str = ".jpg") -> str:
-    known = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
-    path = url.split("?")[0]
-    _, ext = os.path.splitext(path)
-    return ext.lower() if ext.lower() in known else default
-
-
-def _ext_from_data_uri(data_uri: str) -> str:
-    """Extract file extension from a data-URI mime type.
-    e.g. 'data:image/jpeg;base64,...' → '.jpg'
+def _bytes_to_webp(image_bytes: bytes, quality: int = 85) -> bytes:
     """
-    mime_map = {
-        "image/jpeg": ".jpg",
-        "image/jpg":  ".jpg",
-        "image/png":  ".png",
-        "image/webp": ".webp",
-        "image/gif":  ".gif",
-        "image/bmp":  ".bmp",
-    }
-    try:
-        header = data_uri.split(";")[0]          # 'data:image/jpeg'
-        mime   = header.split(":")[1].lower()    # 'image/jpeg'
-        return mime_map.get(mime, ".jpg")
-    except Exception:
-        return ".jpg"
+    Convert raw image bytes (any format) to WebP bytes using Pillow.
+    RGBA images are flattened to RGB so WebP saves cleanly.
+    """
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="WEBP", quality=quality)
+    return buf.getvalue()
 
 
-def _save_data_uri(data_uri: str, filepath: str) -> bool:
-    """Decode a base64 data-URI and write it to *filepath*. Returns True on success."""
-    try:
-        # Format: data:<mime>;base64,<data>
-        _, encoded = data_uri.split(",", 1)
-        image_bytes = base64.b64decode(encoded)
-        with open(filepath, "wb") as f:
-            f.write(image_bytes)
-        return True
-    except Exception as exc:
-        logger.error("Failed to decode data-URI: %s", exc)
-        return False
+def _decode_data_uri(data_uri: str) -> bytes:
+    """Decode a base64 data-URI to raw bytes."""
+    _, encoded = data_uri.split(",", 1)
+    return base64.b64decode(encoded)
+
+
+def _build_url(base_url: Optional[str], filepath: str) -> str:
+    """
+    Combine base_url with a file path.
+    e.g. base_url="http://192.168.1.10:5000", filepath="static/plants/sunflower_1.webp"
+    → "http://192.168.1.10:5000/static/plants/sunflower_1.webp"
+
+    If base_url is None, returns the bare file path unchanged.
+    """
+    if not base_url:
+        return filepath
+    return f"{base_url.rstrip('/')}/{filepath.lstrip('/')}"
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +162,9 @@ def create_driver(
 
     Parameters
     ----------
-    chrome_version : int or None
-        Major Chrome/Chromium version. Auto-detected if None.
-    window_size : tuple
-        (width, height) for the browser window.
-    start_xvfb : bool
-        Start Xvfb virtual display on headless Linux servers.
+    chrome_version : int or None  – auto-detected if None
+    window_size    : tuple        – (width, height)
+    start_xvfb     : bool         – start Xvfb on headless Linux servers
     """
     global _vdisplay
 
@@ -186,17 +174,13 @@ def create_driver(
             _vdisplay.start()
             logger.info("Xvfb virtual display started.")
         else:
-            logger.warning(
-                "xvfbwrapper not installed. "
-                "If headless, run: pip install xvfbwrapper"
-            )
+            logger.warning("xvfbwrapper not installed. Run: pip install xvfbwrapper")
 
     binary = _find_chromium_binary()
     if not binary:
         raise FileNotFoundError(
             "Could not find Chrome or Chromium. "
-            "Install: sudo apt-get install -y chromium-browser  "
-            "      or sudo snap install chromium"
+            "Install: sudo apt-get install -y chromium-browser"
         )
     logger.info("Using browser binary: %s", binary)
 
@@ -255,43 +239,33 @@ def scrape_thumbnails(
     """
     Scrape Google Images and return thumbnail URLs / data-URIs for *query*.
 
-    Strategy
-    --------
-    We request _CANDIDATE_MULTIPLIER × count candidates from the DOM so we
-    can prefer real HTTP URLs over data-URIs.  If not enough HTTP URLs are
-    found we fall back to data-URIs to always return exactly `count` results.
-
     Parameters
     ----------
-    driver            : uc.Chrome  – driver from create_driver()
-    query             : str        – search term
-    count             : int        – number of thumbnails to return (default 3)
-    min_width/height  : int        – minimum pixel dimensions
-    page_load_timeout : int        – seconds to wait for initial images
-    lazy_load_timeout : int        – seconds to wait for lazy-loaded images
+    driver            : uc.Chrome – driver from create_driver()
+    query             : str       – search term e.g. "sunflower"
+    count             : int       – thumbnails to return (default 3)
+    min_width/height  : int       – minimum pixel dimensions to accept
+    page_load_timeout : int       – seconds to wait for initial DOM images
+    lazy_load_timeout : int       – seconds to wait for lazy-loaded images
 
     Returns
     -------
     list[str]  – up to `count` src values (http URLs or data-URIs)
     """
     start_time = time.time()
-    # Fetch more candidates than needed so we can prefer HTTP over data-URIs
     candidate_count = count * _CANDIDATE_MULTIPLIER
 
     with _driver_lock:
         try:
             driver.get(f"https://www.google.com/search?q={query}&tbm=isch")
 
-            # Wait for initial images
             WebDriverWait(driver, page_load_timeout).until(
                 lambda d: len(d.find_elements(By.CSS_SELECTOR, "img[src]")) >= count
             )
 
-            # Scroll to trigger lazy loading
             driver.execute_script("window.scrollTo(0, 800);")
-            time.sleep(1)  # brief pause for lazy images to begin loading
-
-            # Wait for a good pool of HTTP candidates
+            time.sleep(1)
+            
             try:
                 WebDriverWait(driver, lazy_load_timeout).until(
                     lambda d: len(d.find_elements(
@@ -299,34 +273,22 @@ def scrape_thumbnails(
                     )) >= candidate_count
                 )
             except Exception:
-                # If we can't get candidate_count, continue with whatever is there
-                logger.info("Timeout waiting for %d candidates; proceeding with available images.", candidate_count)
+                logger.info("Timeout waiting for %d candidates; using available images.", candidate_count)
 
             img_elements = driver.find_elements(
                 By.CSS_SELECTOR, "img[src^='http'], img[src^='data:image']"
             )
 
-            # Batch JS call to read src + dimensions
             image_data = driver.execute_script("""
                 var imgs = arguments[0];
                 var out  = [];
                 for (var i = 0; i < imgs.length; i++) {
-                    out.push({
-                        src: imgs[i].src,
-                        w:   imgs[i].naturalWidth,
-                        h:   imgs[i].naturalHeight
-                    });
+                    out.push({ src: imgs[i].src, w: imgs[i].naturalWidth, h: imgs[i].naturalHeight });
                 }
                 return out;
             """, img_elements)
 
-            # Filter by minimum dimensions
-            valid = [
-                d for d in image_data
-                if d["src"] and d["w"] >= min_width and d["h"] >= min_height
-            ]
-
-            # Prefer real HTTP URLs; fall back to data-URIs if not enough
+            valid     = [d for d in image_data if d["src"] and d["w"] >= min_width and d["h"] >= min_height]
             http_srcs = [d["src"] for d in valid if d["src"].startswith("http")]
             data_srcs = [d["src"] for d in valid if d["src"].startswith("data:")]
 
@@ -334,20 +296,19 @@ def scrape_thumbnails(
                 selected = http_srcs[:count]
                 logger.info("Using %d HTTP URL(s) for '%s'.", count, query)
             else:
-                # Pad with data-URIs to reach `count`
                 needed   = count - len(http_srcs)
                 selected = http_srcs + data_srcs[:needed]
                 logger.info(
-                    "Only %d HTTP URL(s) found for '%s'; padding with %d data-URI(s).",
+                    "Only %d HTTP URL(s) for '%s'; padding with %d data-URI(s).",
                     len(http_srcs), query, len(selected) - len(http_srcs),
                 )
 
             elapsed = time.time() - start_time
-            logger.info("Query '%s' — returning %d thumbnail(s) in %.2fs.", query, len(selected), elapsed)
+            logger.info("Query '%s' — %d thumbnail(s) in %.2fs.", query, len(selected), elapsed)
             return selected
 
         except Exception as exc:
-            logger.error("scrape_thumbnails failed for query '%s': %s", query, exc)
+            logger.error("scrape_thumbnails failed for '%s': %s", query, exc)
             return []
 
 
@@ -355,28 +316,33 @@ def download_thumbnails(
     urls: list[str],
     query: str,
     save_dir: str = PLANTS_DIR,
+    base_url: Optional[str] = None,
+    webp_quality: int = 85,
     timeout: int = 10,
 ) -> list[str]:
     """
-    Download / decode thumbnail images and save them to *save_dir*.
+    Download / decode thumbnails, convert to WebP, and save to *save_dir*.
 
-    Naming convention:  <query_prefix>_1.<ext>,  _2.<ext>,  _3.<ext>
-    e.g.  query="sunflower"  →  sunflower_1.jpg, sunflower_2.jpg, sunflower_3.jpg
-
-    Both HTTP URLs and data-URIs are handled:
-      - HTTP URL  → downloaded with requests
-      - data-URI  → base64-decoded and written directly (no network call)
+    Naming:  <query_prefix>_1.webp,  _2.webp,  _3.webp
+    e.g. query="sunflower"  →  sunflower_1.webp, sunflower_2.webp, sunflower_3.webp
 
     Parameters
     ----------
-    urls     : list[str]  – srcs from scrape_thumbnails()
-    query    : str        – original search query (used as filename prefix)
-    save_dir : str        – destination directory (created if absent)
-    timeout  : int        – per-request HTTP timeout in seconds
+    urls         : list[str]      – srcs from scrape_thumbnails()
+    query        : str            – search query (used as filename prefix)
+    save_dir     : str            – destination folder (auto-created if absent)
+    base_url     : str or None    – prepend this to every returned path, e.g.
+                                    "http://192.168.1.10:5000"
+                                    → "http://192.168.1.10:5000/static/plants/sunflower_1.webp"
+                                    Leave None to return bare file paths.
+    webp_quality : int            – WebP compression quality 1-100 (default 85)
+    timeout      : int            – HTTP download timeout in seconds
 
     Returns
     -------
-    list[str]  – file paths of successfully saved images
+    list[str]
+        Full URLs (if base_url given) or bare file paths of saved .webp files.
+        e.g. ["http://192.168.1.10:5000/static/plants/sunflower_1.webp", ...]
     """
     os.makedirs(save_dir, exist_ok=True)
     prefix = _query_to_prefix(query)
@@ -389,59 +355,56 @@ def download_thumbnails(
         )
     }
 
-    saved_paths: list[str] = []
+    result_urls: list[str] = []
 
     for index, url in enumerate(urls, start=1):
-        if url.startswith("data:"):
-            # ── data-URI: decode base64 directly ──────────────────────────
-            ext      = _ext_from_data_uri(url)
-            filename = f"{prefix}_{index}{ext}"
-            filepath = os.path.join(save_dir, filename)
+        filename = f"{prefix}_{index}.webp"           # always .webp
+        filepath = os.path.join(save_dir, filename)
 
-            if _save_data_uri(url, filepath):
-                size = os.path.getsize(filepath)
-                logger.info("Saved (data-URI): %s  (%d bytes)", filepath, size)
-                saved_paths.append(filepath)
-            # else: error already logged inside _save_data_uri
-
-        else:
-            # ── HTTP URL: download with requests ──────────────────────────
-            ext      = _ext_from_url(url)
-            filename = f"{prefix}_{index}{ext}"
-            filepath = os.path.join(save_dir, filename)
-
-            try:
-                response = requests.get(url, headers=headers, timeout=timeout)
+        try:
+            # ── Step 1: get raw bytes (HTTP or data-URI) ──────────────────
+            if url.startswith("data:"):
+                raw_bytes = _decode_data_uri(url)
+                source    = "data-URI"
+            else:
+                response  = requests.get(url, headers=headers, timeout=timeout)
                 response.raise_for_status()
+                raw_bytes = response.content
+                source    = "HTTP"
+                
+            # ── Step 2: convert to WebP via Pillow ────────────────────────
+            webp_bytes = _bytes_to_webp(raw_bytes, quality=webp_quality)
 
-                with open(filepath, "wb") as f:
-                    f.write(response.content)
+            # ── Step 3: write to disk ─────────────────────────────────────
+            with open(filepath, "wb") as f:
+                f.write(webp_bytes)
 
-                logger.info("Saved (HTTP): %s  (%d bytes)", filepath, len(response.content))
-                saved_paths.append(filepath)
+            logger.info("Saved (%s → WebP): %s  (%d bytes)", source, filepath, len(webp_bytes))
 
-            except Exception as exc:
-                logger.error("Failed to download '%s': %s", url, exc)
+            # ── Step 4: build return URL ──────────────────────────────────
+            result_urls.append(_build_url(base_url, filepath))
 
-    return saved_paths
+        except Exception as exc:
+            logger.error("Failed to process image %d for '%s': %s", index, query, exc)
+
+    return result_urls
 
 
 def shutdown_driver(driver: uc.Chrome) -> None:
-    """Quit the Chrome driver and stop the virtual display (if started)."""
+    """Quit the Chrome driver and stop Xvfb (if started)."""
     global _vdisplay
-
     try:
         driver.quit()
         logger.info("Chrome driver shut down.")
     except Exception as exc:
-        logger.warning("Error while quitting driver: %s", exc)
+        logger.warning("Error quitting driver: %s", exc)
 
     if _vdisplay is not None:
         try:
             _vdisplay.stop()
             logger.info("Xvfb virtual display stopped.")
         except Exception as exc:
-            logger.warning("Error while stopping Xvfb: %s", exc)
+            logger.warning("Error stopping Xvfb: %s", exc)
         _vdisplay = None
 
 
@@ -449,19 +412,17 @@ def shutdown_driver(driver: uc.Chrome) -> None:
 # Quick self-test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    driver = create_driver()
+    BASE_URL = "http://127.0.0.1:5000"   # ← change to your server IP:port
 
+    driver = create_driver()
     try:
         queries = ["Fagus grandiflora", "Quercus robur", "Betula pendula"]
-
         for q in queries:
             results = scrape_thumbnails(driver, q)
-            print(f"\n--- {q} ({len(results)} result(s)) ---")
-            for link in results:
-                print(link if link.startswith("http") else f"[data-URI  {link[:40]}...]")
-
-            saved = download_thumbnails(results, q)
-            print(f"Saved {len(saved)} file(s): {saved}")
+            saved   = download_thumbnails(results, q, base_url=BASE_URL)
+            print(f"\n--- {q} ---")
+            for url in saved:
+                print(url)
     finally:
         shutdown_driver(driver)
         os._exit(0)
